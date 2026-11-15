@@ -1,7 +1,8 @@
 /*
  * FP16 (IEEE 754 binary16) divider, Newton-Raphson reciprocal.
  * Round-to-nearest-even, full subnormal support, all five IEEE flags.
- * One shared 17x18 multiplier, sequenced by an FSM (10 cycles per divide).
+ * One shared radix-4 sequential multiplier (2 multiplier bits per cycle),
+ * sequenced by an FSM (~58 cycles per divide).
  * Bit-exact with model/fp16_div_model.py.
  */
 `default_nettype none
@@ -19,13 +20,17 @@ module fp16_div_core (
 );
 
     localparam [3:0] S_IDLE  = 4'd0,
-                     S_NR_A  = 4'd1,
-                     S_NR_B  = 4'd2,
-                     S_QUO   = 4'd3,
-                     S_REM   = 4'd4,
-                     S_CORR  = 4'd5,
-                     S_NORM  = 4'd6,
-                     S_ROUND = 4'd7;
+                     S_NR_A  = 4'd1,   // multiply mb*x (6 steps)
+                     S_NR_AU = 4'd2,   // t = 2 - mb*x
+                     S_NR_B  = 4'd3,   // multiply x*t  (9 steps)
+                     S_NR_BU = 4'd4,   // x = x*t
+                     S_QUO   = 4'd5,   // multiply ma*x (6 steps)
+                     S_QUOU  = 4'd6,   // q = ma*x
+                     S_REM   = 4'd7,   // multiply q*mb (6 steps)
+                     S_REMU  = 4'd8,   // r = ma<<13 - q*mb
+                     S_CORR  = 4'd9,
+                     S_NORM  = 4'd10,
+                     S_ROUND = 4'd11;
 
     reg [3:0] state;
     assign busy = (state != S_IDLE);
@@ -105,20 +110,39 @@ module fp16_div_core (
     reg        [13:0] qn;
     reg               tiny;
 
-    // ---------------- shared multiplier ----------------
-    reg  [16:0] mul_a;
-    reg  [17:0] mul_b;
-    wire [34:0] prod = mul_a * mul_b;
+    // ---------------- shared radix-4 sequential multiplier ----------------
+    // pr = {H[20:0], L[17:0]}: L starts as the scanned operand B, H accumulates.
+    // Each step adds dig*A (dig = L[1:0], 0..3) to H and shifts {sum, L} right by 2.
+    // After n steps the product is pr >> (18 - 2n).
+    reg  [17:0] mul_a;               // multiplicand
+    reg  [17:0] mul_b;               // scanned operand
+    reg         mul_n9;              // 1: 9 steps (18-bit B), 0: 6 steps (12-bit B)
+    reg  [38:0] pr;
+    reg  [3:0]  cnt;
+    reg         mrun;
 
     always @(*) begin
         case (state)
-            S_NR_A:  begin mul_a = x;            mul_b = {7'd0, mb}; end
-            S_NR_B:  begin mul_a = x;            mul_b = t;          end
-            S_QUO:   begin mul_a = x;            mul_b = {7'd0, ma}; end
-            S_REM:   begin mul_a = {2'd0, q};    mul_b = {7'd0, mb}; end
-            default: begin mul_a = 17'd0;        mul_b = 18'd0;      end
+            S_NR_A:  begin mul_a = {1'b0, x};     mul_b = {7'd0, mb}; mul_n9 = 1'b0; end
+            S_NR_B:  begin mul_a = t;             mul_b = {1'b0, x};  mul_n9 = 1'b1; end
+            S_QUO:   begin mul_a = {1'b0, x};     mul_b = {7'd0, ma}; mul_n9 = 1'b0; end
+            S_REM:   begin mul_a = {3'd0, q};     mul_b = {7'd0, mb}; mul_n9 = 1'b0; end
+            default: begin mul_a = 18'd0;         mul_b = 18'd0;      mul_n9 = 1'b0; end
         endcase
     end
+
+    wire [1:0]  dig   = pr[1:0];
+    wire [20:0] a1    = {3'd0, mul_a};
+    wire [20:0] a2    = {2'd0, mul_a, 1'b0};
+    wire [20:0] pp    = (dig == 2'd0) ? 21'd0 :
+                        (dig == 2'd1) ? a1 :
+                        (dig == 2'd2) ? a2 : (a1 + a2);
+    wire [21:0] psum  = {1'b0, pr[38:18]} + {1'b0, pp};
+    wire [39:0] pnext = {psum, pr[17:0]} >> 2;
+    wire [34:0] prod6 = {2'b00, pr[38:6]};   // product after 6 steps
+    wire [34:0] prod9 = pr[34:0];            // product after 9 steps
+
+    wire        m_last = mrun && (cnt == 4'd1);
 
     // ---------------- normalise / round (combinational) ----------------
     wire               nrm     = ~q[13];
@@ -156,6 +180,7 @@ module fp16_div_core (
             s <= 1'b0; ma <= 11'd0; mb <= 11'd0; E <= 8'sd0;
             x <= 17'd0; t <= 18'd0; q <= 15'd0; r <= 27'sd0;
             rem_nz <= 1'b0; iter <= 1'b0; qn <= 14'd0; tiny <= 1'b0;
+            pr <= 39'd0; cnt <= 4'd0; mrun <= 1'b0;
         end else begin
             done <= 1'b0;
             case (state)
@@ -174,21 +199,35 @@ module fp16_div_core (
                     end else
                         state <= S_NR_A;
                 end
-                S_NR_A: begin
-                    t     <= 18'd131072 - prod[27:10];         // 2 - b*x
+                S_NR_A, S_NR_B, S_QUO, S_REM: begin
+                    if (!mrun) begin
+                        pr   <= {21'd0, mul_b};
+                        cnt  <= mul_n9 ? 4'd9 : 4'd6;
+                        mrun <= 1'b1;
+                    end else begin
+                        pr   <= pnext[38:0];
+                        cnt  <= cnt - 4'd1;
+                        if (m_last) begin
+                            mrun  <= 1'b0;
+                            state <= state + 4'd1;          // to the matching *U state
+                        end
+                    end
+                end
+                S_NR_AU: begin
+                    t     <= 18'd131072 - prod6[27:10];         // 2 - b*x
                     state <= S_NR_B;
                 end
-                S_NR_B: begin
-                    x     <= prod[32:16];                      // x*(2 - b*x)
+                S_NR_BU: begin
+                    x     <= prod9[32:16];                      // x*(2 - b*x)
                     iter  <= 1'b1;
                     state <= iter ? S_QUO : S_NR_A;
                 end
-                S_QUO: begin
-                    q     <= prod[27:13];                      // a*x
+                S_QUOU: begin
+                    q     <= prod6[27:13];                      // a*x
                     state <= S_REM;
                 end
-                S_REM: begin
-                    r     <= $signed({3'b000, ma, 13'd0}) - $signed({1'b0, prod[25:0]});
+                S_REMU: begin
+                    r     <= $signed({3'b000, ma, 13'd0}) - $signed({1'b0, prod6[25:0]});
                     state <= S_CORR;
                 end
                 S_CORR: begin

@@ -34,6 +34,8 @@
   "//": "FP16 divider: repair slew after routing",
   "RUN_POST_GRT_DESIGN_REPAIR": 1,
   "DESIGN_REPAIR_MAX_WIRE_LENGTH": 100,
+  "EXTRA_EXCLUDED_CELLS": ["sky130_fd_sc_hd__buf_1", "sky130_fd_sc_hd__clkdlybuf4s25_1"],
+  "CTS_SINK_CLUSTERING_SIZE": 16,
 
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
