@@ -47,7 +47,7 @@ async def divide(dut, a, b):
     dut.uio_in.value = START
     await ClockCycles(dut.clk, 3)
     dut.uio_in.value = 0
-    for _ in range(120):
+    for _ in range(200):
         await ClockCycles(dut.clk, 1)
         if int(dut.uio_out.value) & 0x80:
             break

@@ -1,90 +1,79 @@
 /*
- * FP16 (IEEE 754 binary16) divider, Newton-Raphson reciprocal.
+ * FP16 (IEEE 754 binary16) divider, Newton-Raphson reciprocal - 1-tile version.
  * Round-to-nearest-even, full subnormal support, all five IEEE flags.
- * One shared radix-4 sequential multiplier (2 multiplier bits per cycle),
- * sequenced by an FSM (~58 cycles per divide).
+ * Area-optimised: radix-2 sequential multiplier, bit-serial (de)normalisation,
+ * operand registers reused for working values and the result.
  * Bit-exact with model/fp16_div_model.py.
+ *
+ * Write port: wr_en (1-cycle pulse), wr_addr 0..3 = A lo, A hi, B lo, B hi.
+ * Read port : rd_addr 0..3 = Q lo, Q hi, flags, status (combinational).
+ * The result Q overwrites A; write all four bytes before every start.
  */
 `default_nettype none
 
 module fp16_div_core (
-    input  wire        clk,
-    input  wire        rst_n,
-    input  wire        start,
-    input  wire [15:0] a,
-    input  wire [15:0] b,
-    output reg  [15:0] result,
-    output reg  [4:0]  flags,      // {invalid, divzero, overflow, underflow, inexact}
-    output wire        busy,
-    output reg         done
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire       wr_en,
+    input  wire [1:0] wr_addr,
+    input  wire [7:0] wr_data,
+    input  wire       start,
+    input  wire [1:0] rd_addr,
+    output reg  [7:0] rd_data,
+    output wire       busy,
+    output reg        done
 );
 
-    localparam [3:0] S_IDLE  = 4'd0,
-                     S_NR_A  = 4'd1,   // multiply mb*x (6 steps)
-                     S_NR_AU = 4'd2,   // t = 2 - mb*x
-                     S_NR_B  = 4'd3,   // multiply x*t  (9 steps)
-                     S_NR_BU = 4'd4,   // x = x*t
-                     S_QUO   = 4'd5,   // multiply ma*x (6 steps)
-                     S_QUOU  = 4'd6,   // q = ma*x
-                     S_REM   = 4'd7,   // multiply q*mb (6 steps)
-                     S_REMU  = 4'd8,   // r = ma<<13 - q*mb
-                     S_CORR  = 4'd9,
-                     S_NORM  = 4'd10,
-                     S_ROUND = 4'd11;
+    localparam [4:0] S_IDLE = 5'd0,
+                     S_NIN  = 5'd1,   // normalise subnormal inputs, then seed
+                     S_MBX  = 5'd2,   // multiply mb * x
+                     S_T    = 5'd3,   // t = 2 - mb*x
+                     S_MXT  = 5'd4,   // multiply x * t
+                     S_XU   = 5'd5,   // x = x*t
+                     S_MAX  = 5'd6,   // multiply ma * x
+                     S_QU   = 5'd7,   // q = ma*x
+                     S_MQB  = 5'd8,   // multiply q * mb
+                     S_R    = 5'd9,   // r = -(q*mb) mod 2^13
+                     S_C1   = 5'd10,  // compare r with 0 and mb
+                     S_CNEG = 5'd11,  // r < 0: sticky from r + mb
+                     S_CDEC = 5'd12,  // q = q - 1
+                     S_CINC = 5'd13,  // q = q + 1
+                     S_NORM = 5'd14,  // normalise q
+                     S_TINY = 5'd15,  // tininess (after rounding)
+                     S_DEN  = 5'd16,  // denormalise for subnormal results
+                     S_RND  = 5'd17;  // round, pack, flags
 
-    reg [3:0] state;
+    reg  [4:0]  state;
+    reg  [15:0] ra, rb;        // operands; ra[10:0]/rb[10:0] become mantissas, ra becomes Q
+    reg  signed [7:0] E;
+    reg  [16:0] x;
+    reg  [17:0] tq;            // t during NR, then q
+    reg  [35:0] pr;            // {H[18:0], L[16:0]} multiplier accumulator, holds r afterwards
+    reg  [4:0]  cnt;
+    reg  [4:0]  flags;
+    reg         stk, iter, tiny, subn;
+
     assign busy = (state != S_IDLE);
 
-    // ---------------- unpack (combinational on inputs) ----------------
-    wire        sa = a[15], sb = b[15];
-    wire [4:0]  ea = a[14:10], eb = b[14:10];
-    wire [9:0]  fa = a[9:0],  fb = b[9:0];
-
+    // ---------------- special cases (decoded from raw operands at start) ----------------
+    wire [4:0] ea = ra[14:10], eb = rb[14:10];
+    wire [9:0] fa = ra[9:0],   fb = rb[9:0];
     wire a_zero = (ea == 5'd0)  && (fa == 10'd0);
     wire b_zero = (eb == 5'd0)  && (fb == 10'd0);
-    wire a_sub  = (ea == 5'd0)  && (fa != 10'd0);
-    wire b_sub  = (eb == 5'd0)  && (fb != 10'd0);
     wire a_inf  = (ea == 5'd31) && (fa == 10'd0);
     wire b_inf  = (eb == 5'd31) && (fb == 10'd0);
     wire a_nan  = (ea == 5'd31) && (fa != 10'd0);
     wire b_nan  = (eb == 5'd31) && (fb != 10'd0);
-    wire a_snan = a_nan && !fa[9];
-    wire b_snan = b_nan && !fb[9];
-
-    function [3:0] clz10;          // leading zeros of a 10-bit value, as an 11-bit field (>= 1)
-        input [9:0] f;
-        begin
-            casez (f)
-                10'b1?????????: clz10 = 4'd1;
-                10'b01????????: clz10 = 4'd2;
-                10'b001???????: clz10 = 4'd3;
-                10'b0001??????: clz10 = 4'd4;
-                10'b00001?????: clz10 = 4'd5;
-                10'b000001????: clz10 = 4'd6;
-                10'b0000001???: clz10 = 4'd7;
-                10'b00000001??: clz10 = 4'd8;
-                10'b000000001?: clz10 = 4'd9;
-                default:        clz10 = 4'd10;
-            endcase
-        end
-    endfunction
-
-    wire [3:0]  lza = clz10(fa);
-    wire [3:0]  lzb = clz10(fb);
-    wire [10:0] ma_n = a_sub ? ({1'b0, fa} << lza) : {1'b1, fa};
-    wire [10:0] mb_n = b_sub ? ({1'b0, fb} << lzb) : {1'b1, fb};
-    wire signed [7:0] Ea_n = a_sub ? (8'sd1 - $signed({4'd0, lza})) : $signed({3'd0, ea});
-    wire signed [7:0] Eb_n = b_sub ? (8'sd1 - $signed({4'd0, lzb})) : $signed({3'd0, eb});
-
-    wire invalid_n = (a_zero && b_zero) || (a_inf && b_inf) || a_snan || b_snan;
+    wire invalid_n = (a_zero && b_zero) || (a_inf && b_inf) ||
+                     (a_nan && !fa[9]) || (b_nan && !fb[9]);
     wire nan_n     = a_nan || b_nan || invalid_n;
     wire divz_n    = b_zero && !a_zero && !a_inf && !a_nan;
     wire inf_n     = (a_inf && !b_inf && !b_nan) || divz_n;
     wire zero_n    = (a_zero && !b_zero && !b_nan && !a_nan) || (b_inf && !a_inf && !a_nan);
-    wire special_n = nan_n || inf_n || zero_n;
-    wire s_n       = sa ^ sb;
+    wire s_n       = ra[15] ^ rb[15];
+    wire [4:0] ea1 = (ea == 5'd0) ? 5'd1 : ea;
+    wire [4:0] eb1 = (eb == 5'd0) ? 5'd1 : eb;
 
-    // seed table: 1/midpoint of mantissa interval, 6 fractional bits
     function [5:0] seed;
         input [3:0] i;
         begin
@@ -97,161 +86,202 @@ module fp16_div_core (
         end
     endfunction
 
-    // ---------------- datapath registers ----------------
-    reg               s;
-    reg        [10:0] ma, mb;
-    reg signed [7:0]  E;
-    reg        [16:0] x;
-    reg        [17:0] t;
-    reg        [14:0] q;
-    reg signed [26:0] r;
-    reg               rem_nz;
-    reg               iter;
-    reg        [13:0] qn;
-    reg               tiny;
+    wire [10:0] ma = ra[10:0];
+    wire [10:0] mb = rb[10:0];
 
-    // ---------------- shared radix-4 sequential multiplier ----------------
-    // pr = {H[20:0], L[17:0]}: L starts as the scanned operand B, H accumulates.
-    // Each step adds dig*A (dig = L[1:0], 0..3) to H and shifts {sum, L} right by 2.
-    // After n steps the product is pr >> (18 - 2n).
-    reg  [17:0] mul_a;               // multiplicand
-    reg  [17:0] mul_b;               // scanned operand
-    reg         mul_n9;              // 1: 9 steps (18-bit B), 0: 6 steps (12-bit B)
-    reg  [38:0] pr;
-    reg  [3:0]  cnt;
-    reg         mrun;
+    // ---------------- radix-2 multiplier + main adder ----------------
+    // Multiplicand selects x or tq; scanned operand (loaded into L) selects mb, x or ma.
+    wire        mul_state = (state == S_MBX) || (state == S_MXT) || (state == S_MAX) || (state == S_MQB);
+    wire        n17       = (state == S_MXT);
+    wire [17:0] mcand     = (state == S_MXT || state == S_MQB) ? tq : {1'b0, x};
+    wire [16:0] mscan     = (state == S_MXT) ? x : (state == S_MAX) ? {6'd0, ma} : {6'd0, mb};
 
+    // main adder: accumulate, or two's-complement negate (t and r)
+    reg  [19:0] add_a, add_b;
+    reg         add_c;
     always @(*) begin
+        add_a = 20'd0; add_b = 20'd0; add_c = 1'b0;
         case (state)
-            S_NR_A:  begin mul_a = {1'b0, x};     mul_b = {7'd0, mb}; mul_n9 = 1'b0; end
-            S_NR_B:  begin mul_a = t;             mul_b = {1'b0, x};  mul_n9 = 1'b1; end
-            S_QUO:   begin mul_a = {1'b0, x};     mul_b = {7'd0, ma}; mul_n9 = 1'b0; end
-            S_REM:   begin mul_a = {3'd0, q};     mul_b = {7'd0, mb}; mul_n9 = 1'b0; end
-            default: begin mul_a = 18'd0;         mul_b = 18'd0;      mul_n9 = 1'b0; end
+            S_T: begin add_b = {2'b11, ~pr[33:16]}; add_c = 1'b1; end         // -(mb*x >> 10)
+            S_R: begin add_b = {7'h7F, ~pr[18:6]};  add_c = 1'b1; end         // -(q*mb) low 13 bits
+            default: begin
+                add_a = {1'b0, pr[35:17]};
+                add_b = pr[0] ? {2'b00, mcand} : 20'd0;
+            end
         endcase
     end
+    wire [19:0] add_s = add_a + add_b + {19'd0, add_c};
 
-    wire [1:0]  dig   = pr[1:0];
-    wire [20:0] a1    = {3'd0, mul_a};
-    wire [20:0] a2    = {2'd0, mul_a, 1'b0};
-    wire [20:0] pp    = (dig == 2'd0) ? 21'd0 :
-                        (dig == 2'd1) ? a1 :
-                        (dig == 2'd2) ? a2 : (a1 + a2);
-    wire [21:0] psum  = {1'b0, pr[38:18]} + {1'b0, pp};
-    wire [39:0] pnext = {psum, pr[17:0]} >> 2;
-    wire [34:0] prod6 = {2'b00, pr[38:6]};   // product after 6 steps
-    wire [34:0] prod9 = pr[34:0];            // product after 9 steps
+    // ---------------- normalise / tininess / rounding inputs ----------------
+    wire        nrm     = ~tq[13];
+    wire [10:0] keep_u  = tq[13:3];
+    wire        inc_u   = tq[2] & ((|tq[1:0]) | stk | keep_u[0]);
+    wire        carry_u = inc_u & (&keep_u);
 
-    wire        m_last = mrun && (cnt == 4'd1);
+    wire        rnd     = tq[2];
+    wire        stk2    = (|tq[1:0]) | stk;
+    wire        inexact = rnd | stk2;
+    wire        rnd_inc = rnd & (stk2 | tq[3]);
 
-    // ---------------- normalise / round (combinational) ----------------
-    wire               nrm     = ~q[13];
-    wire        [13:0] qn_n    = nrm ? {q[12:0], 1'b0} : q[13:0];
-    wire signed [7:0]  En      = E - {7'd0, nrm};
-    wire        [10:0] keep_u  = qn_n[13:3];
-    wire               inc_u   = qn_n[2] & ((|qn_n[1:0]) | rem_nz | keep_u[0]);
-    wire               carry_u = inc_u & (&keep_u);
-    wire               tiny_n  = (En < 0) || ((En == 0) && !carry_u);
+    // ---------------- small adder: remainder correction, q +/- 1, rounding ----------------
+    wire signed [13:0] r13  = {pr[12], pr[12:0]};
+    reg  [14:0] sa_a, sa_b;
+    reg         sa_c;
+    always @(*) begin
+        sa_a = 15'd0; sa_b = 15'd0; sa_c = 1'b0;
+        case (state)
+            S_C1:   begin sa_a = {r13[13], r13}; sa_b = ~{4'd0, mb}; sa_c = 1'b1; end   // r - mb
+            S_CNEG: begin sa_a = {r13[13], r13}; sa_b = {4'd0, mb};               end   // r + mb
+            S_CDEC: begin sa_a = tq[14:0];       sa_b = 15'h7FFF;                 end   // q - 1
+            S_CINC: begin sa_a = tq[14:0];       sa_c = 1'b1;                     end   // q + 1
+            S_RND:  begin sa_a = {4'd0, tq[13:3]}; sa_c = rnd_inc;                end   // keep + inc
+            default: ;
+        endcase
+    end
+    wire [14:0] sa_s = sa_a + sa_b + {14'd0, sa_c};
 
-    wire               subn    = (E <= 0);                    // E holds En in S_ROUND
-    wire signed [7:0]  sh_s    = 8'sd1 - E;
-    wire        [3:0]  sh      = !subn ? 4'd0 : (sh_s > 8'sd15) ? 4'd15 : sh_s[3:0];
-    wire        [13:0] qd      = qn >> sh;
-    wire        [13:0] lost    = qn & ~({14{1'b1}} << sh);
-    wire        [10:0] keep    = qd[13:3];
-    wire               rnd     = qd[2];
-    wire               stk     = (|qd[1:0]) | rem_nz | (|lost);
-    wire               inexact = rnd | stk;
-    wire        [11:0] keep2   = {1'b0, keep} + {11'd0, rnd & (stk | keep[0])};
-    wire signed [7:0]  Eb0     = subn ? 8'sd0 : E;
-    wire signed [7:0]  Er      = keep2[11] ? (Eb0 + 8'sd1) :
-                                 (subn && keep2[10]) ? 8'sd1 : Eb0;
-    wire        [9:0]  frac    = keep2[11] ? keep2[10:1] : keep2[9:0];
-    wire               ovf     = (Er >= 8'sd31);
-    wire               unf     = tiny & inexact;
+    // ---------------- round / pack ----------------
+    wire [11:0] keep2   = sa_s[11:0];
+    wire signed [7:0] Eb0 = subn ? 8'sd0 : E;
+    wire signed [7:0] Er  = keep2[11] ? (Eb0 + 8'sd1) : (subn && keep2[10]) ? 8'sd1 : Eb0;
+    wire [9:0]  frac    = keep2[11] ? keep2[10:1] : keep2[9:0];
+    wire        ovf     = (Er >= 8'sd31);
+
+    // ---------------- read port ----------------
+    always @(*) begin
+        case (rd_addr)
+            2'd0:    rd_data = ra[7:0];
+            2'd1:    rd_data = ra[15:8];
+            2'd2:    rd_data = {3'b000, flags};
+            default: rd_data = {6'd0, busy, 1'b0};
+        endcase
+    end
 
     // ---------------- FSM ----------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state  <= S_IDLE;
-            result <= 16'd0;
-            flags  <= 5'd0;
-            done   <= 1'b0;
-            s <= 1'b0; ma <= 11'd0; mb <= 11'd0; E <= 8'sd0;
-            x <= 17'd0; t <= 18'd0; q <= 15'd0; r <= 27'sd0;
-            rem_nz <= 1'b0; iter <= 1'b0; qn <= 14'd0; tiny <= 1'b0;
-            pr <= 39'd0; cnt <= 4'd0; mrun <= 1'b0;
+            state <= S_IDLE; ra <= 16'd0; rb <= 16'd0; E <= 8'sd0;
+            x <= 17'd0; tq <= 18'd0; pr <= 36'd0; cnt <= 5'd0; flags <= 5'd0;
+            stk <= 1'b0; iter <= 1'b0; tiny <= 1'b0; subn <= 1'b0; done <= 1'b0;
         end else begin
             done <= 1'b0;
-            case (state)
-                S_IDLE: if (start) begin
-                    s  <= s_n;
-                    ma <= ma_n;
-                    mb <= mb_n;
-                    E  <= Ea_n - Eb_n + 8'sd15;
-                    x  <= {1'b0, seed(mb_n[9:6]), 10'd0};
-                    iter <= 1'b0;
-                    if (special_n) begin
-                        result <= nan_n ? 16'h7E00 :
-                                  inf_n ? {s_n, 15'h7C00} : {s_n, 15'd0};
-                        flags  <= {invalid_n, divz_n, 3'b000};
-                        done   <= 1'b1;
-                    end else
-                        state <= S_NR_A;
+
+            if (mul_state) begin
+                if (cnt == 5'd0) begin
+                    pr  <= {19'd0, mscan};
+                    cnt <= n17 ? 5'd17 : 5'd11;
+                end else begin
+                    pr  <= {add_s, pr[16:1]};
+                    cnt <= cnt - 5'd1;
                 end
-                S_NR_A, S_NR_B, S_QUO, S_REM: begin
-                    if (!mrun) begin
-                        pr   <= {21'd0, mul_b};
-                        cnt  <= mul_n9 ? 4'd9 : 4'd6;
-                        mrun <= 1'b1;
-                    end else begin
-                        pr   <= pnext[38:0];
-                        cnt  <= cnt - 4'd1;
-                        if (m_last) begin
-                            mrun  <= 1'b0;
-                            state <= state + 4'd1;          // to the matching *U state
+            end
+
+            case (state)
+                S_IDLE: begin
+                    if (wr_en) begin
+                        case (wr_addr)
+                            2'd0: ra[7:0]  <= wr_data;
+                            2'd1: ra[15:8] <= wr_data;
+                            2'd2: rb[7:0]  <= wr_data;
+                            2'd3: rb[15:8] <= wr_data;
+                        endcase
+                    end
+                    if (start) begin
+                        if (nan_n || inf_n || zero_n) begin
+                            ra    <= nan_n ? 16'h7E00 : inf_n ? {s_n, 15'h7C00} : {s_n, 15'd0};
+                            flags <= {invalid_n, divz_n, 3'b000};
+                            done  <= 1'b1;
+                        end else begin
+                            ra    <= {s_n, 4'd0, (ea != 5'd0), fa};
+                            rb    <= {5'd0, (eb != 5'd0), fb};
+                            E     <= $signed({3'd0, ea1}) - $signed({3'd0, eb1}) + 8'sd15;
+                            stk   <= 1'b0;
+                            state <= S_NIN;
                         end
                     end
                 end
-                S_NR_AU: begin
-                    t     <= 18'd131072 - prod6[27:10];         // 2 - b*x
-                    state <= S_NR_B;
+                S_NIN: begin
+                    if (ra[10] && rb[10]) begin
+                        x     <= {1'b0, seed(rb[9:6]), 10'd0};
+                        iter  <= 1'b0;
+                        state <= S_MBX;
+                    end else begin
+                        if (!ra[10]) ra[10:0] <= {ra[9:0], 1'b0};
+                        if (!rb[10]) rb[10:0] <= {rb[9:0], 1'b0};
+                        E <= E + (rb[10] ? 8'sd0 : 8'sd1) - (ra[10] ? 8'sd0 : 8'sd1);
+                    end
                 end
-                S_NR_BU: begin
-                    x     <= prod9[32:16];                      // x*(2 - b*x)
+                S_MBX: if (cnt == 5'd1) state <= S_T;
+                S_T: begin
+                    tq    <= {1'b0, add_s[16:0]};
+                    state <= S_MXT;
+                end
+                S_MXT: if (cnt == 5'd1) state <= S_XU;
+                S_XU: begin
+                    x     <= pr[32:16];
                     iter  <= 1'b1;
-                    state <= iter ? S_QUO : S_NR_A;
+                    state <= iter ? S_MAX : S_MBX;
                 end
-                S_QUOU: begin
-                    q     <= prod6[27:13];                      // a*x
-                    state <= S_REM;
+                S_MAX: if (cnt == 5'd1) state <= S_QU;
+                S_QU: begin
+                    tq    <= {3'd0, pr[33:19]};
+                    state <= S_MQB;
                 end
-                S_REMU: begin
-                    r     <= $signed({3'b000, ma, 13'd0}) - $signed({1'b0, prod6[25:0]});
-                    state <= S_CORR;
+                S_MQB: if (cnt == 5'd1) state <= S_R;
+                S_R: begin
+                    pr[12:0] <= add_s[12:0];
+                    state    <= S_C1;
                 end
-                S_CORR: begin
-                    if (r < 0) begin
-                        q <= q - 15'd1;  rem_nz <= (r + $signed({16'd0, mb})) != 0;
-                    end else if (r >= $signed({16'd0, mb})) begin
-                        q <= q + 15'd1;  rem_nz <= (r - $signed({16'd0, mb})) != 0;
-                    end else
-                        rem_nz <= (r != 0);
-                    state <= S_NORM;
+                S_C1: begin
+                    if (r13 < 0)
+                        state <= S_CNEG;
+                    else if (!sa_s[14]) begin               // r - mb >= 0
+                        stk   <= (sa_s[13:0] != 14'd0);
+                        state <= S_CINC;
+                    end else begin
+                        stk   <= (r13 != 14'sd0);
+                        state <= S_NORM;
+                    end
+                end
+                S_CNEG: begin
+                    stk   <= (sa_s[13:0] != 14'd0);
+                    state <= S_CDEC;
+                end
+                S_CDEC: begin
+                    tq[14:0] <= sa_s;
+                    state    <= S_NORM;
+                end
+                S_CINC: begin
+                    tq[14:0] <= sa_s;
+                    state    <= S_NORM;
                 end
                 S_NORM: begin
-                    qn    <= qn_n;
-                    E     <= En;
-                    tiny  <= tiny_n;
-                    state <= S_ROUND;
+                    if (nrm) begin
+                        tq[13:0] <= {tq[12:0], 1'b0};
+                        E        <= E - 8'sd1;
+                    end
+                    state <= S_TINY;
                 end
-                S_ROUND: begin
+                S_TINY: begin
+                    tiny  <= (E < 0) || ((E == 0) && !carry_u);
+                    subn  <= (E <= 0);
+                    state <= S_DEN;
+                end
+                S_DEN: begin
+                    if ((E < 8'sd1) && (tq[13:0] != 14'd0)) begin
+                        tq[13:0] <= {1'b0, tq[13:1]};
+                        stk      <= stk | tq[0];
+                        E        <= E + 8'sd1;
+                    end else
+                        state <= S_RND;
+                end
+                S_RND: begin
                     if (ovf) begin
-                        result <= {s, 15'h7C00};
-                        flags  <= 5'b00101;
+                        ra    <= {ra[15], 15'h7C00};
+                        flags <= 5'b00101;
                     end else begin
-                        result <= {s, Er[4:0], frac};
-                        flags  <= {3'b000, unf, inexact};
+                        ra    <= {ra[15], Er[4:0], frac};
+                        flags <= {3'b000, tiny & inexact, inexact};
                     end
                     done  <= 1'b1;
                     state <= S_IDLE;
