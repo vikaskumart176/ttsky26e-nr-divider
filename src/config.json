@@ -13,7 +13,7 @@
 
   "//": "PL_TARGET_DENSITY_PCT - You can increase this if Global Placement fails with error GPL-0302.",
   "//": "Users have reported that values up to 80 worked well for them.",
-  "PL_TARGET_DENSITY_PCT": 70,
+  "PL_TARGET_DENSITY_PCT": 80,
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
@@ -31,11 +31,7 @@
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
   "CLOCK_PORT": "clk",
 
-  "//": "FP16 divider: repair slew after routing",
-  "RUN_POST_GRT_DESIGN_REPAIR": 1,
-  "DESIGN_REPAIR_MAX_WIRE_LENGTH": 100,
-  "EXTRA_EXCLUDED_CELLS": ["sky130_fd_sc_hd__buf_1", "sky130_fd_sc_hd__clkdlybuf4s25_1"],
-  "CTS_SINK_CLUSTERING_SIZE": 16,
+  "//": "FP16 divider: 1x1 settings",
 
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
