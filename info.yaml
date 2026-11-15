@@ -3,7 +3,7 @@ project:
   title:        "Newton-Raphson Divider"      # Project title
   author:       "Vikas, Shreekara, SreeHarsha, Girish, Kartik, Tharun"
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "16-bit by 8-bit Newton-Raphson hardware divider"      # One line description of what your project does
+  description: "IEEE 754 half-precision (FP16) divider using Newton-Raphson reciprocal iteration"
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     33333333       # Clock frequency in Hz (or 0 if not applicable)
 
