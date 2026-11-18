@@ -1,0 +1,28 @@
+.DS_Store
+.idea
+*.vcd
+*.fst
+*.fst.hier
+runs
+tt_submission
+src/user_config.json
+src/config_merged.json
+test/sim_build
+test/__pycache__/
+test/results.xml
+test/gate_level_netlist.v
+
+# local environment and tools
+.venv/
+tt/
+__pycache__/
+
+# core-level vector regression and SoftFloat / TestFloat
+test/*.hex
+test/tb_vectors
+test/tb_mantissa
+test/tb_fault
+model/softfloat/berkeley-softfloat-3/
+model/softfloat/berkeley-testfloat-3/
+model/softfloat/sfdiv
+model/softfloat/sfall

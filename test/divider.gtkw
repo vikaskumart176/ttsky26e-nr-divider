@@ -1,0 +1,40 @@
+[*] FP16 NR divider - key signals
+@200
+-Chip pins
+@28
+tb.clk
+tb.rst_n
+@22
+tb.ui_in[7:0]
+tb.uio_in[7:0]
+tb.uo_out[7:0]
+tb.uio_out[7:0]
+@200
+-Core handshake
+@28
+tb.user_project.u_core.start
+tb.user_project.u_core.busy
+tb.user_project.u_core.done
+@24
+tb.user_project.u_core.state[3:0]
+@28
+tb.user_project.u_core.mrun
+@24
+tb.user_project.u_core.cnt[3:0]
+@200
+-Operands and result
+@22
+tb.user_project.u_core.a[15:0]
+tb.user_project.u_core.b[15:0]
+tb.user_project.u_core.result[15:0]
+@28
+tb.user_project.u_core.flags[4:0]
+@200
+-Datapath
+@22
+tb.user_project.u_core.ma[10:0]
+tb.user_project.u_core.mb[10:0]
+tb.user_project.u_core.x[16:0]
+tb.user_project.u_core.t[17:0]
+tb.user_project.u_core.pr[38:0]
+tb.user_project.u_core.q[14:0]
