@@ -63,7 +63,7 @@ still correctly rounded. This was established by exhaustive search over all 1,04
 normalised mantissas (`model/verify_mantissa.py`).
 
 A divide takes **49 clock cycles**. A power-of-two divisor (mantissa exactly 1.0) skips the reciprocal and
-takes 2 cycles; special cases such as 0, infinity or NaN take 1. The design is clocked at **33 MHz**, so
+takes 2 cycles; special cases such as 0, infinity or NaN take 1. The design is clocked at **25 MHz**, so
 one divide takes about 1.5 us.
 
 **Verification**
@@ -98,7 +98,7 @@ and reads 0 in normal operation. Status byte: `{0, 0, 0, 0, 0, 0, busy, done}`.
 
 **To perform one division:**
 
-1. Reset the design (`rst_n` low, then high) and provide a clock (up to 33 MHz).
+1. Reset the design (`rst_n` low, then high) and provide a clock (up to 25 MHz).
 2. For each of the four bytes (A low, A high, B low, B high): put the byte on `ui_in`, set `uio_in[1:0]` to its
    address, raise `uio_in[2]` for at least 3 clock cycles, then lower it.
 3. Set the rounding mode on `uio_in[5:4]` (0 for the usual round-to-nearest-even), then pulse `uio_in[3]`
