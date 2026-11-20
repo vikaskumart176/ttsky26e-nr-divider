@@ -64,7 +64,7 @@ normalised mantissas (`model/verify_mantissa.py`).
 
 A divide takes **49 clock cycles**. A power-of-two divisor (mantissa exactly 1.0) skips the reciprocal and
 takes 2 cycles; special cases such as 0, infinity or NaN take 1. The design is clocked at **25 MHz**, so
-one divide takes about 1.5 us.
+one divide takes about 2 us.
 
 **Verification**
 
