@@ -1,4 +1,8 @@
 /*
+ * Copyright (c) 2026 Vikas, Shreekara, SreeHarsha, Girish, Kartik, Tharun
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/*
  * FP16 (IEEE 754 binary16) divider, Newton-Raphson reciprocal.
  * All four IEEE 754 rounding modes, full subnormal support, all five IEEE flags.
  * Bit-exact with model/fp16_div_model.py.
